@@ -6,9 +6,10 @@
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | 防撤回 | ✅ 稳定 | 原消息保留，无撤回通知 |
-| 撤回标注 | ✅ 稳定 | 黄色横幅显示在聊天窗口底部，8秒后消失 |
+| 撤回标注（窗口 banner） | ✅ 稳定 | 黄色横幅显示在聊天窗口底部，8秒后消失 |
+| 撤回标注（气泡着色） | 🔬 未来方向 | 直接修改被撤回消息的气泡颜色/字体，见下方开发路线图 |
 
-**标注效果**：撤回发生时，WeChat 窗口底部出现黄色横幅，显示自定义文字（当前：`𝟚𝕏𝟚𝕃 𝚌𝚊𝚕𝚕𝚒𝚗𝚐 𝙲𝚀`），8 秒后自动消失。原消息始终保留在聊天记录中。
+**当前标注效果**：撤回发生时，WeChat 窗口底部出现黄色横幅，显示自定义文字（当前：`𝟚𝕏𝟚𝕃 𝚌𝚊𝚕𝚕𝚒𝚗𝚐 𝙲𝚀`），8 秒后自动消失。原消息始终保留在聊天记录中。
 
 ---
 
@@ -174,6 +175,62 @@ VA 到文件偏移：`file_offset = 0x97C8000 + VA`（__TEXT fileoff=0）
 clang -dynamiclib -arch arm64 -framework Foundation -lobjc \
       -o antirevoke.dylib antirevoke.c
 ```
+
+---
+
+## 未来开发方向：气泡着色（C++ vtable hook）
+
+> **结论：可解决，原理上与找到 `isRevokeMessage` 属于同一难度量级。**
+> 当初 `isRevokeMessage` 也是在 338,185 个函数里从零定位的，本项目已有完整的工具链和方法论。
+
+### 目标效果
+
+被撤回的消息气泡变色（如红色边框、灰化字体），无论用户何时回到屏幕都能一眼识别，不依赖临时 banner。
+
+### 技术路线
+
+WeChat macOS 的聊天渲染层是纯 C++ + Qt（已确认：无 ObjC 类可 swizzle）。实现气泡着色需要以下步骤：
+
+**Step 1：定位 `mmui::ChatBubbleItemView`（或 `ChatTextItemView`）的 vtable**
+
+- 在 wechat.dylib `__cstring` 段搜索 `"ChatBubbleItemView"` 或 `"ChatTextItemView"` 字符串
+- 用 ADRP+ADD 链分析找到引用该字符串的代码位置（即类注册或 RTTI 数据）
+- 从 RTTI/type_info 结构推导出 vtable 地址
+- 工具：capstone 反汇编 + 现有 `analyze_handler.py` 框架
+
+**Step 2：识别"绘制单条消息"的虚方法**
+
+- vtable 里按 index 逐一分析，找到参数中含消息对象指针的 draw 方法
+- 参考已知的 `OnMessageRevoke`、`UpdateBubbleData`、`drawRect:` 等入口
+- 可通过在 vtable 各 slot 设置 guard hook，观察调用时机来定位
+
+**Step 3：在 hook 里识别当前渲染的消息**
+
+- C++ 消息对象的 `this` 指针作为第一个参数传入渲染方法
+- 找到消息 ID 字段在 C++ 对象内的偏移（参考 type 10002 消息对象已知的 SSO string 偏移分析方法）
+- 对比 `g_revoked[]` 集合，判断是否需要着色
+
+**Step 4：修改渲染颜色并处理 cell 复用**
+
+- 在 hook 内修改 C++ 对象的颜色/样式字段，或直接修改 CALayer 属性
+- Qt 的 cell 复用机制要求每次渲染时都做判断（不能一次性写死）
+- 可通过修改 vtable slot 指针实现持久 hook
+
+### 已知信息（可复用）
+
+| 已有 | 用途 |
+|------|------|
+| `g_revoked[]` + 持久化文件 | 撤回消息 ID 集合，hook 可直接查询 |
+| SSO string 解析 | 从 C++ 对象读取消息 ID |
+| guard variable hook 机制 | 同样适用于 vtable slot hook |
+| `analyze_handler.py` | capstone 反汇编框架，可复用于 vtable 分析 |
+| wechat.dylib 段结构、VA→文件偏移 | 已知，直接用 |
+
+### 预期阻力
+
+- **C++ RTTI 可能被 strip**：如果没有类名字符串，需要从已知的 `OnMessageRevoke` 调用回溯到包含它的类
+- **Qt 批量渲染**：如果整个聊天列表是一次性绘制而非逐 cell 调用，需要找更上层的 layout 方法
+- **cell 复用颜色重置**：需要确保每次 cell 被重用时 hook 都重新着色
 
 ---
 
