@@ -236,6 +236,7 @@ WeChat macOS 的聊天渲染层是纯 C++ + Qt（已确认：无 ObjC 类可 swi
 - **C++ RTTI 可能被 strip**：如果没有类名字符串，需要从已知的 `OnMessageRevoke` 调用回溯到包含它的类
 - **Qt 批量渲染**：如果整个聊天列表是一次性绘制而非逐 cell 调用，需要找更上层的 layout 方法
 - **cell 复用颜色重置**：需要确保每次 cell 被重用时 hook 都重新着色
+- **群聊与私聊需同等验证**：当前日志已确认两种场景的撤回 hook 均触发（私聊 `sender=wxid_xxx`，群聊 `sender=xxxxx@chatroom`），但渲染路径可能不同——群聊气泡和私聊气泡很可能走不同的 C++ 渲染类或 vtable slot。开发时必须对两种场景分别测试，不能只验证私聊就认为群聊同样生效。
 
 ---
 
