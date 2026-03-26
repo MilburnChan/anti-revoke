@@ -186,7 +186,9 @@ def compile_dylib(source_dir):
         print(f"Error: {src} not found")
         return None
     result = subprocess.run(
-        ["clang", "-dynamiclib", "-arch", "arm64", "-o", out, src],
+        ["clang", "-dynamiclib", "-arch", "arm64",
+         "-framework", "Foundation", "-lobjc",
+         "-o", out, src],
         capture_output=True, text=True
     )
     if result.returncode != 0:
@@ -286,7 +288,14 @@ def main():
     dylib_installed = os.path.exists(os.path.join(FRAMEWORKS_DIR, DYLIB_NAME))
 
     if all_patched and dylib_already_loaded and dylib_installed:
-        print("\nAll patches and hook dylib already applied!")
+        # Dylib file may have been updated — always reinstall to pick up changes
+        print("\nBinary patches already applied. Reinstalling hook dylib...")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if install_dylib(script_dir):
+            print("\nRe-signing...")
+            if codesign(app_path):
+                print("Codesign OK")
+            print("\nDone! Restart WeChat for changes to take effect.")
         return
 
     if all_patched and not args.dry_run:
