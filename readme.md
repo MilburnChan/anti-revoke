@@ -240,6 +240,58 @@ WeChat macOS 的聊天渲染层是纯 C++ + Qt（已确认：无 ObjC 类可 swi
 
 ---
 
+## 未来开发任务：macOS 端自撤回拦截
+
+> **当前状态**：macOS 端自撤回**不拦截**（passthrough），避免崩溃。他人撤回和手机端自撤回均正常拦截。
+
+### 问题本质
+
+macOS 微信自撤回有两条独立路径：
+
+1. **本地路径**：用户点击"撤回" → C++ handler 立即在本地执行撤回（更新 DB + UI），**不经过 `isRevokeMessage`**
+2. **服务器确认路径**：服务器回发 type 10002 消息 → 经过 `isRevokeMessage` → 我们的 hook
+
+当前 hook 只拦截路径 2（服务器确认），但路径 1 已经在 hook 被调用前完成了撤回。
+
+### 已验证的约束（避坑清单）
+
+| 尝试 | 结果 | 原因 |
+|------|------|------|
+| `isRevokeMessage` 返回 FALSE | 崩溃 (SIGSEGV) | 其他线程期望撤回结果对象存在于 `[msg+0x1e0]`，返回 FALSE 不创建 → NULL 解引用 |
+| `isRevokeMessage` 返回 TRUE + 篡改 XML 中的 msgid/newmsgid | 不崩溃但撤回仍执行 | 撤回处理器从结构体二进制字段读取 ID，不从 XML 重新解析 |
+| 修改 `msg+0x0c` type 字段（10002→1） | 崩溃 | 下游代码按 type=1 访问文本字段，结构体不匹配 |
+| hook `0x4291990` 前置检查（guard `0x8f8afe0`） | 崩溃 | 该函数检查 type==10000（非撤回类型），hook 它会干扰其他系统消息处理 |
+| `vm_protect` + NOP 指令 patch | 失败 | Apple Silicon 硬件 W^X 保护，`__TEXT` 段不可写 |
+| ObjC runtime 扫描 | 无结果 | WeChat 核心逻辑全在 C++ 中，ObjC runtime 中无撤回相关类/方法 |
+
+### macOS 自撤回的特征（用于识别）
+
+macOS 端自撤回会在 `isRevokeMessage` hook 中触发**两次调用**：
+1. 一次正常包：`sender=当前用户wxid, replacemsg="你撤回了一条消息"`
+2. 一次空包（malformed）：`sender="", msgid=0, newmsgid=0`
+
+手机端自撤回只有一次正常包，无空包伴随。当前代码使用 `mach_absolute_time()` 时间窗口配对来区分两者。
+
+### 可行方向（需进一步 RE）
+
+1. **IDA/Ghidra 逆向**：从 `OnMenuRevokeMessage` / `SendRevokeRequest` 字符串定位本地撤回 C++ 函数，寻找 guard variable 或可 hook 的函数指针
+2. **WCDB 层拦截**：hook revoke handler 中的 WCDB 写操作（已知 BL 地址见上方"撤回 handler 关键 BL"表），阻止本地 DB 更新
+3. **vtable slot hook**：revoke action 对象的 vtable `0x8a12750`，其虚方法执行实际撤回操作，可尝试替换为 no-op
+
+### 关键地址（build 36603）
+
+| 项目 | 地址 |
+|------|------|
+| isRevokeMessage callsite | `0x44d1ca0` (`bl 0x4294e1c`) |
+| callsite 返回后的 cbz | `0x44d1ca4` (`cbz w0, 0x44d1db4`) |
+| revoke 结果对象分配 | `0x44d1ca8` (0x2c0 bytes) |
+| revoke action vtable | `0x8a12750` |
+| 结果对象存储位置 | `[msg+0x1e0]` 和 `[msg+0x1e8]` |
+| 前置检查函数 | `0x4291990` (guard `0x8f8afe0`, 检查 type==10000) |
+| 崩溃现场 | `wechat.dylib+0x292fcc8`, thread 18, SIGSEGV @ NULL+0x148 |
+
+---
+
 ## 注意事项
 
 - WeChat 版本：4.1.8.29（build 36603），更新后地址可能变化

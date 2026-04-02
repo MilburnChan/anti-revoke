@@ -23,6 +23,7 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <dispatch/dispatch.h>
+#include <mach/mach_time.h>
 
 /* ------------------------------------------------------------------ */
 /* Addresses — build 36603                                             */
@@ -234,10 +235,42 @@ int hook_isRevokeMessage_impl(void *msg, void *lr) {
            (unsigned long long)newmsgid,
            replacemsg);
 
+    int is_self_text = (replacemsg[0] != '\0' &&
+                        strstr(replacemsg, "\xe4\xbd\xa0\xe6\x92\xa4\xe5\x9b\x9e") != NULL);
+    int is_malformed = (!sender || !*sender) && msgid == 0 && newmsgid == 0;
+
+    /* macOS-initiated self-revoke produces a malformed companion packet;
+       phone-initiated self-revoke does not.  Use a time window to pair them. */
+    static uint64_t g_malformed_ts = 0;  /* mach_absolute_time of last malformed */
+    static uint64_t g_self_ts = 0;       /* mach_absolute_time of last self-text */
+
+    uint64_t now = mach_absolute_time();
+    /* ~1 second window (mach_absolute_time ticks, arm64 ≈ 24MHz) */
+    const uint64_t WINDOW = 24000000ULL * 2;
+
+    if (is_malformed) {
+        g_malformed_ts = now;
+        /* Check if a self-text was seen recently → macOS-initiated pair */
+        int from_macos = (g_self_ts && (now - g_self_ts) < WINDOW);
+        logmsg("[revoke] malformed packet, from_macos=%d → passthrough\n", from_macos);
+        return 1;  /* always passthrough malformed to avoid crash */
+    }
+
+    if (is_self_text) {
+        g_self_ts = now;
+        /* Check if a malformed packet was seen recently → macOS-initiated pair */
+        int from_macos = (g_malformed_ts && (now - g_malformed_ts) < WINDOW);
+        logmsg("[revoke] self-revoke, from_macos=%d\n", from_macos);
+        if (from_macos) {
+            return 1;  /* macOS-initiated: passthrough to avoid crash */
+        }
+        /* Phone-initiated: fall through to block */
+    }
+
     if (newmsgid) revoked_add(newmsgid);
     if (msgid)    revoked_add(msgid);
 
-    /* Build subtitle string and dispatch to main thread */
+    /* Show indicator */
     char *info = malloc(256);
     if (info) {
         snprintf(info, 256, "𝟚𝕏𝟚𝕃 𝚌𝚊𝚕𝚕𝚒𝚗𝚐 𝙲𝚀");
@@ -245,7 +278,7 @@ int hook_isRevokeMessage_impl(void *msg, void *lr) {
                          (dispatch_function_t)show_revoke_indicator);
     }
 
-    return 0;  /* FALSE: block revoke, original message preserved */
+    return 0;  /* FALSE: block revoke */
 }
 
 /* ------------------------------------------------------------------ */
