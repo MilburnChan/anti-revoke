@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Anti-Revoke Patch for WeChat macOS (version 36603+)
+Anti-revoke patch for WeChat macOS (Apple Silicon).
 
 Two-layer defense:
-  1. Binary patch: isRevokeMessage() returns false — keeps original message visible
-  2. Hook dylib: prepends revoke marker to notification text — shows which message was recalled
+  1. Binary patch: isRevokeMessage() returns false before the hook dylib loads
+  2. Hook dylib: installs a guard hook so revoke packets keep being blocked at runtime
+
+The script does not rely on a single hardcoded build any more. It resolves the
+current build's isRevokeMessage stub and guard variable directly from
+wechat.dylib, then compiles antirevoke.dylib with the resolved guard address.
 
 Usage:
   python3 patch_wechat.py [--backup] [--restore] [--dry-run]
@@ -20,9 +24,22 @@ import plistlib
 WECHAT_APP = "/Applications/WeChat.app"
 BINARY = os.path.join(WECHAT_APP, "Contents/Frameworks/wechat.dylib")
 FRAMEWORKS_DIR = os.path.join(WECHAT_APP, "Contents/Frameworks")
-SUPPORTED_BUILD = "36603"
+VALIDATED_SHORT_VERSION = "4.1.8"
 DYLIB_NAME = "antirevoke.dylib"
 DYLIB_LOAD_PATH = "@loader_path/antirevoke.dylib"
+
+ORIGINAL_REVOKE_BODY = bytes([
+    0x08, 0x0C, 0x40, 0xB9,  # ldr w8, [x0, #0xc]
+    0x49, 0xE2, 0x84, 0x52,  # mov w9, #0x2712
+    0x1F, 0x01, 0x09, 0x6B,  # cmp w8, w9
+    0xE0, 0x17, 0x9F, 0x1A,  # cset w0, eq
+    0xC0, 0x03, 0x5F, 0xD6,  # ret
+])
+PATCHED_REVOKE_PREFIX = bytes([
+    0x00, 0x00, 0x80, 0x52,  # mov w0, #0
+    0xC0, 0x03, 0x5F, 0xD6,  # ret
+])
+PATCHED_REVOKE_BODY = PATCHED_REVOKE_PREFIX + ORIGINAL_REVOKE_BODY[8:]
 
 def find_arm64_slice(data):
     magic = struct.unpack(">I", data[:4])[0]
@@ -44,24 +61,111 @@ class Patch:
         self.patched_bytes = patched_bytes
         self.description = description
 
-PATCHES = [
-    Patch(
-        name="isRevokeMessage_return_false",
-        va=0x4294e2c,
-        original_bytes=bytes([
-            0x08, 0x0C, 0x40, 0xB9,  # ldr w8, [x0, #0xc]
-            0x49, 0xE2, 0x84, 0x52,  # mov w9, #0x2712
-        ]),
-        patched_bytes=bytes([
-            0x00, 0x00, 0x80, 0x52,  # mov w0, #0
-            0xC0, 0x03, 0x5F, 0xD6,  # ret
-        ]),
-        description="isRevokeMessage() always returns false — keeps original message visible"
-    ),
-    # Patch 2 is intentionally NOT applied: let the "xxx recalled a message"
-    # system notification appear normally, so the user knows a revoke was attempted.
-    # The original message is preserved by Patch 1.
-]
+class ResolvedTarget:
+    def __init__(self, patch, guard_va, stub_va, state):
+        self.patch = patch
+        self.guard_va = guard_va
+        self.stub_va = stub_va
+        self.state = state
+
+
+def sign_extend(value, bits):
+    sign_bit = 1 << (bits - 1)
+    return (value & (sign_bit - 1)) - (value & sign_bit)
+
+
+def decode_adrp(word, pc):
+    if (word & 0x9F000000) != 0x90000000:
+        return None
+    rd = word & 0x1F
+    immlo = (word >> 29) & 0x3
+    immhi = (word >> 5) & 0x7FFFF
+    imm = sign_extend((immhi << 2) | immlo, 21) << 12
+    target = (pc & ~0xFFF) + imm
+    return rd, target
+
+
+def decode_ldr_x_uimm(word):
+    if (word & 0xFFC00000) != 0xF9400000:
+        return None
+    rt = word & 0x1F
+    rn = (word >> 5) & 0x1F
+    imm12 = (word >> 10) & 0xFFF
+    return rt, rn, imm12 * 8
+
+
+def decode_cbz_x(word, pc):
+    if (word & 0x7F000000) != 0x34000000:
+        return None
+    if (word & 0x80000000) == 0:
+        return None
+    rt = word & 0x1F
+    imm19 = (word >> 5) & 0x7FFFF
+    target = pc + (sign_extend(imm19, 19) << 2)
+    return rt, target
+
+
+def decode_br(word):
+    if (word & 0xFFFFFC1F) != 0xD61F0000:
+        return None
+    return (word >> 5) & 0x1F
+
+
+def resolve_revoke_target(data, slice_offset, slice_size):
+    """Locate isRevokeMessage and its guard variable in the current arm64 slice."""
+    blob = data[slice_offset:slice_offset + slice_size]
+    body_len = len(ORIGINAL_REVOKE_BODY)
+    candidates = []
+
+    max_off = len(blob) - (16 + body_len)
+    for stub_va in range(0, max_off + 1, 4):
+        w0, w1, w2, w3 = struct.unpack_from("<IIII", blob, stub_va)
+        adrp = decode_adrp(w0, stub_va)
+        ldr = decode_ldr_x_uimm(w1)
+        cbz = decode_cbz_x(w2, stub_va + 8)
+        br_reg = decode_br(w3)
+        if not adrp or not ldr or not cbz or br_reg is None:
+            continue
+
+        adrp_reg, page_va = adrp
+        ldr_rt, ldr_rn, ldr_disp = ldr
+        cbz_reg, cbz_target = cbz
+        if not (adrp_reg == ldr_rt == ldr_rn == cbz_reg == br_reg):
+            continue
+
+        body_va = stub_va + 16
+        if cbz_target != body_va:
+            continue
+
+        body = blob[body_va:body_va + body_len]
+        if body == ORIGINAL_REVOKE_BODY:
+            state = "original"
+        elif body == PATCHED_REVOKE_BODY:
+            state = "patched"
+        else:
+            continue
+
+        candidates.append(
+            ResolvedTarget(
+                patch=Patch(
+                    name="isRevokeMessage_return_false",
+                    va=body_va,
+                    original_bytes=ORIGINAL_REVOKE_BODY[:8],
+                    patched_bytes=PATCHED_REVOKE_PREFIX,
+                    description="isRevokeMessage() always returns false — keeps original message visible",
+                ),
+                guard_va=page_va + ldr_disp,
+                stub_va=stub_va,
+                state=state,
+            )
+        )
+
+    if not candidates:
+        raise ValueError("Could not locate isRevokeMessage stub in the current arm64 slice")
+    if len(candidates) != 1:
+        detail = ", ".join(hex(c.patch.va) for c in candidates[:8])
+        raise ValueError(f"Expected 1 isRevokeMessage candidate, found {len(candidates)}: {detail}")
+    return candidates[0]
 
 def verify_patches(data, slice_offset, patches):
     """Check that original bytes match at expected locations."""
@@ -178,7 +282,7 @@ def inject_load_dylib(data, slice_offset, dylib_path):
     return bytes(data)
 
 
-def compile_dylib(source_dir):
+def compile_dylib(source_dir, guard_va):
     """Compile antirevoke.dylib from source."""
     src = os.path.join(source_dir, "antirevoke.c")
     out = os.path.join(source_dir, DYLIB_NAME)
@@ -187,6 +291,7 @@ def compile_dylib(source_dir):
         return None
     result = subprocess.run(
         ["clang", "-dynamiclib", "-arch", "arm64",
+         f"-DIS_REVOKE_MSG_GUARD_VA=0x{guard_va:x}",
          "-o", out, src],
         capture_output=True, text=True
     )
@@ -194,12 +299,13 @@ def compile_dylib(source_dir):
         print(f"Error compiling {src}: {result.stderr}")
         return None
     print(f"  Compiled: {out}")
+    print(f"  Guard VA: 0x{guard_va:x}")
     return out
 
 
-def install_dylib(source_dir):
+def install_dylib(source_dir, guard_va):
     """Compile and copy antirevoke.dylib to Frameworks dir."""
-    dylib_src = compile_dylib(source_dir)
+    dylib_src = compile_dylib(source_dir, guard_va)
     if not dylib_src:
         return False
     dst = os.path.join(FRAMEWORKS_DIR, DYLIB_NAME)
@@ -229,13 +335,9 @@ def main():
     version, build = get_wechat_version(app_path)
     if version:
         print(f"WeChat version: {version} (build {build})")
-        if build != SUPPORTED_BUILD:
-            print(f"WARNING: This patch is designed for build {SUPPORTED_BUILD}.")
-            print(f"         Your build is {build}. Patches may not work correctly.")
-            if not args.dry_run:
-                resp = input("Continue anyway? [y/N] ")
-                if resp.lower() != 'y':
-                    sys.exit(0)
+        if version != VALIDATED_SHORT_VERSION:
+            print(f"WARNING: This workflow is validated against WeChat {VALIDATED_SHORT_VERSION}.")
+            print("         Auto-resolution will still be attempted on your installed build.")
 
     # Check if running
     if not args.dry_run and check_wechat_running():
@@ -263,10 +365,19 @@ def main():
 
     slice_offset, slice_size = find_arm64_slice(data)
     print(f"ARM64 slice: offset={hex(slice_offset)}, size={hex(slice_size)}")
+    try:
+        target = resolve_revoke_target(data, slice_offset, slice_size)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    print(f"Resolved revoke stub @ VA {hex(target.stub_va)}")
+    print(f"Resolved patch site @ VA {hex(target.patch.va)} ({target.state})")
+    print(f"Resolved guard VA @ {hex(target.guard_va)}")
+    patches = [target.patch]
 
     # Verify
     print("\nVerifying patches:")
-    results = verify_patches(data, slice_offset, PATCHES)
+    results = verify_patches(data, slice_offset, patches)
 
     all_match = True
     all_patched = True
@@ -290,7 +401,7 @@ def main():
         # Dylib file may have been updated — always reinstall to pick up changes
         print("\nBinary patches already applied. Reinstalling hook dylib...")
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        if install_dylib(script_dir):
+        if install_dylib(script_dir, target.guard_va):
             print("\nRe-signing...")
             if codesign(app_path):
                 print("Codesign OK")
@@ -302,8 +413,8 @@ def main():
 
     if not all_match and not all_patched:
         print("\nError: Some patches don't match expected bytes.")
-        print("This may be a different version of WeChat.")
-        print("Patches are designed for version 36603.")
+        print("Auto-resolution succeeded, but the bytes at the patch site are unexpected.")
+        print("Please restore your backup or inspect whether the binary was modified by another tool.")
         sys.exit(1)
 
     if args.dry_run:
@@ -328,8 +439,8 @@ def main():
     # Apply binary patches if needed
     if not all_patched:
         print("\nApplying binary patches...")
-        patched_data = apply_patches(patched_data, slice_offset, PATCHES)
-        results2 = verify_patches(patched_data, slice_offset, PATCHES)
+        patched_data = apply_patches(patched_data, slice_offset, patches)
+        results2 = verify_patches(patched_data, slice_offset, patches)
         for p, match, already_patched, actual in results2:
             if not already_patched:
                 print(f"  ERROR: Patch verification failed for {p.name}")
@@ -349,9 +460,9 @@ def main():
     # Compile and install antirevoke.dylib
     print("\nBuilding hook dylib...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if not install_dylib(script_dir):
+    if not install_dylib(script_dir, target.guard_va):
         print("WARNING: Hook dylib installation failed.")
-        print("Anti-revoke still works, but revoke marker won't be shown.")
+        print("Anti-revoke still works via the binary patch, but the runtime hook will be missing.")
 
     # Re-sign
     print("\nRe-signing...")

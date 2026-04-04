@@ -6,6 +6,8 @@
 clang -dynamiclib -arch arm64 -o antirevoke.dylib antirevoke.c
 ```
 
+说明：正常安装应通过 `patch_wechat.py` 触发编译，因为它会把自动解析出的 `IS_REVOKE_MSG_GUARD_VA` 通过 `-D` 注入。
+
 ## Inject & Test
 
 ```bash
@@ -18,22 +20,20 @@ tail -f /tmp/antirevoke_*.log
 
 ## Architecture
 
-- 目标：build 36603（WeChat macOS）
+- 目标：WeChat macOS 4.1.8（Apple Silicon）
 - 策略：hook `isRevokeMessage` via guard variable → 强制返回 FALSE
-- 备用：在 constructor 运行前，通过 `0x4294e2c` 处二进制 patch 提供兜底
-- guard 变量地址：`0x8f8b2a8`（ASLR slide 运行时计算）
+- 备用：在 constructor 运行前，通过 `isRevokeMessage` 起始处二进制 patch 提供兜底
+- patch site / guard 地址：由 `patch_wechat.py` 从当前 `wechat.dylib` 自动解析
 
-## Key Addresses (build 36603)
+## Key Addresses
 
-| Symbol | VA |
-|--------|----|
-| `IS_REVOKE_MSG_GUARD_VA` | `0x8f8b2a8` |
-| binary patch | `0x4294e2c` |
+- 运行时 guard 地址由 `patch_wechat.py` 编译时注入 `-DIS_REVOKE_MSG_GUARD_VA=...`
+- binary patch 地址由 `patch_wechat.py` 在当前 arm64 slice 中自动定位
 
 ## NEVER
 
-- 修改 `IS_REVOKE_MSG_GUARD_VA` 或 patch offset 时不先验证 build 号。
-- 在不确认 WeChat 版本的前提下执行注入。
+- 在未验证 `patch_wechat.py` 自动解析结果前手改地址。
+- 在不确认 WeChat 版本大致仍属于 4.1.8 分支的前提下执行注入。
 
 ## Verification
 

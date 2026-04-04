@@ -1,13 +1,15 @@
 /**
- * antirevoke.dylib — WeChat Anti-Revoke Hook for macOS (build 36603)
+ * antirevoke.dylib — WeChat anti-revoke hook for macOS.
  *
  * Strategy:
- *   Layer 1 — binary patch at 0x4294e2c (fallback, pre-constructor)
- *   Layer 2 — guard variable hook: isRevokeMessage returns FALSE
- *             → original message preserved, revoke blocked
+ *   Layer 1 — binary patch: isRevokeMessage() returns FALSE before constructor
+ *   Layer 2 — guard variable hook: isRevokeMessage() keeps returning FALSE
  *
  * Build:
  *   clang -dynamiclib -arch arm64 -o antirevoke.dylib antirevoke.c
+ *
+ * patch_wechat.py resolves IS_REVOKE_MSG_GUARD_VA from the installed
+ * wechat.dylib and passes it in via -D at build time.
  */
 
 #include <string.h>
@@ -15,15 +17,16 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdlib.h>
-#include <pthread.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
 
 /* ------------------------------------------------------------------ */
-/* Addresses — build 36603                                             */
+/* Addresses                                                            */
 /* ------------------------------------------------------------------ */
+#ifndef IS_REVOKE_MSG_GUARD_VA
 #define IS_REVOKE_MSG_GUARD_VA  0x8f8b2a8
+#endif
 #define MSG_TYPE_OFFSET         0x0c
 #define MSG_SENDER_OFFSET       0x18   /* SSO string: sender wxid      */
 #define MSG_XML_OFFSET          0x138  /* SSO string: revoke XML       */
@@ -81,39 +84,6 @@ static void xml_str(const char *xml, const char *tag, char *buf, size_t bufsz) {
     if (len >= bufsz) len = bufsz - 1;
     memcpy(buf, p, len);
     buf[len] = '\0';
-}
-
-/* ------------------------------------------------------------------ */
-/* Revoked ID set — persistent across WeChat restarts                  */
-/* ------------------------------------------------------------------ */
-#define MAX_REVOKED 8192
-#define REVOKE_PERSIST "/tmp/antirevoke_revoked.txt"
-
-static uint64_t        g_revoked[MAX_REVOKED];
-static int             g_nrevoked = 0;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void revoked_load(void) {
-    FILE *f = fopen(REVOKE_PERSIST, "r");
-    if (!f) return;
-    char line[32];
-    while (fgets(line, sizeof(line), f) && g_nrevoked < MAX_REVOKED) {
-        uint64_t id = strtoull(line, NULL, 10);
-        if (id) g_revoked[g_nrevoked++] = id;
-    }
-    fclose(f);
-    logmsg("[revoked] loaded %d ids from disk\n", g_nrevoked);
-}
-
-static void revoked_add(uint64_t id) {
-    if (!id) return;
-    pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_nrevoked; i++)
-        if (g_revoked[i] == id) { pthread_mutex_unlock(&g_lock); return; }
-    if (g_nrevoked < MAX_REVOKED) g_revoked[g_nrevoked++] = id;
-    pthread_mutex_unlock(&g_lock);
-    FILE *f = fopen(REVOKE_PERSIST, "a");
-    if (f) { fprintf(f, "%llu\n", (unsigned long long)id); fclose(f); }
 }
 
 /* ------------------------------------------------------------------ */
@@ -184,9 +154,6 @@ int hook_isRevokeMessage_impl(void *msg, void *lr) {
     }
 
     /* ---- Others' revoke (or phone self-revoke): BLOCK ---- */
-    if (newmsgid) revoked_add(newmsgid);
-    if (msgid)    revoked_add(msgid);
-
     return 0;  /* FALSE: block revoke, original message preserved */
 }
 
@@ -196,8 +163,6 @@ int hook_isRevokeMessage_impl(void *msg, void *lr) {
 __attribute__((constructor))
 static void antirevoke_init(void) {
     logmsg("[init] antirevoke loaded, pid=%d\n", getpid());
-
-    revoked_load();
 
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
@@ -215,7 +180,8 @@ static void antirevoke_init(void) {
     /* Layer 2: hook isRevokeMessage via guard variable */
     void **guard = (void **)(wechat_base + IS_REVOKE_MSG_GUARD_VA);
     *guard = (void *)hook_isRevokeMessage;
-    logmsg("[init] isRevokeMessage guard set\n");
+    logmsg("[init] isRevokeMessage guard set @ 0x%lx\n",
+           (unsigned long)IS_REVOKE_MSG_GUARD_VA);
 
     logmsg("[init] setup complete\n");
 }
