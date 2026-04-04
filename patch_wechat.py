@@ -187,7 +187,6 @@ def compile_dylib(source_dir):
         return None
     result = subprocess.run(
         ["clang", "-dynamiclib", "-arch", "arm64",
-         "-framework", "Foundation", "-lobjc",
          "-o", out, src],
         capture_output=True, text=True
     )

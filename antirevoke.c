@@ -3,13 +3,11 @@
  *
  * Strategy:
  *   Layer 1 — binary patch at 0x4294e2c (fallback, pre-constructor)
- *   Layer 2 — guard variable hook: isRevokeMessage always returns FALSE
- *   Layer 3 — in-window revoke indicator via NSWindow subtitle
- *              (no class enumeration; no external notifications)
+ *   Layer 2 — guard variable hook: isRevokeMessage returns FALSE
+ *             → original message preserved, revoke blocked
  *
  * Build:
- *   clang -dynamiclib -arch arm64 -framework Foundation -lobjc \
- *         -o antirevoke.dylib antirevoke.c
+ *   clang -dynamiclib -arch arm64 -o antirevoke.dylib antirevoke.c
  */
 
 #include <string.h>
@@ -20,9 +18,6 @@
 #include <pthread.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
-#include <objc/runtime.h>
-#include <objc/message.h>
-#include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 
 /* ------------------------------------------------------------------ */
@@ -72,7 +67,6 @@ static uint64_t xml_u64(const char *xml, const char *tag) {
     return strtoull(p + strlen(open), NULL, 10);
 }
 
-/* Extract text content of an XML tag into buf (null-terminated) */
 static void xml_str(const char *xml, const char *tag, char *buf, size_t bufsz) {
     buf[0] = '\0';
     char open[64], close[64];
@@ -123,80 +117,6 @@ static void revoked_add(uint64_t id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* In-window revoke indicator — injects NSTextField into contentView   */
-/* NSRect on ARM64: 4 doubles = HFA, returned/passed in v0-v3.        */
-/* ------------------------------------------------------------------ */
-typedef struct { double x, y, width, height; } MyRect;
-
-static void show_revoke_indicator(void *ctx) {
-    char *info = (char *)ctx;
-    if (!info) return;
-
-    id app = ((id(*)(Class,SEL))objc_msgSend)(
-        objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-    if (!app) { free(info); return; }
-    id win = ((id(*)(id,SEL))objc_msgSend)(app, sel_registerName("keyWindow"));
-    if (!win) { free(info); return; }
-
-    logmsg("[indicator] window class: %s\n", class_getName(object_getClass(win)));
-
-    id cv = ((id(*)(id,SEL))objc_msgSend)(win, sel_registerName("contentView"));
-    if (!cv) { free(info); return; }
-
-    /* Get contentView bounds (HFA: returned in v0-v3 on ARM64) */
-    MyRect bounds = ((MyRect(*)(id,SEL))objc_msgSend)(cv, sel_registerName("bounds"));
-    logmsg("[indicator] bounds: %.0f x %.0f\n", bounds.width, bounds.height);
-
-    /* Create label at bottom of contentView, full width, 28px tall */
-    MyRect frame = {0.0, 0.0, bounds.width > 0 ? bounds.width : 400.0, 28.0};
-
-    id label = ((id(*)(id,SEL))objc_msgSend)(
-        (id)objc_getClass("NSTextField"), sel_registerName("alloc"));
-    label = ((id(*)(id,SEL,MyRect))objc_msgSend)(
-        label, sel_registerName("initWithFrame:"), frame);
-    if (!label) { free(info); return; }
-
-    /* Configure: non-editable, no border, draws background */
-    ((void(*)(id,SEL,int))objc_msgSend)(label, sel_registerName("setEditable:"),        0);
-    ((void(*)(id,SEL,int))objc_msgSend)(label, sel_registerName("setBezeled:"),         0);
-    ((void(*)(id,SEL,int))objc_msgSend)(label, sel_registerName("setDrawsBackground:"), 1);
-    ((void(*)(id,SEL,int))objc_msgSend)(label, sel_registerName("setAlignment:"),       2); /* center */
-
-    id yellow = ((id(*)(Class,SEL))objc_msgSend)(
-        objc_getClass("NSColor"), sel_registerName("yellowColor"));
-    if (yellow)
-        ((void(*)(id,SEL,id))objc_msgSend)(label, sel_registerName("setBackgroundColor:"), yellow);
-    id black = ((id(*)(Class,SEL))objc_msgSend)(
-        objc_getClass("NSColor"), sel_registerName("blackColor"));
-    if (black)
-        ((void(*)(id,SEL,id))objc_msgSend)(label, sel_registerName("setTextColor:"), black);
-
-    id nsstr = ((id(*)(Class,SEL,const char*))objc_msgSend)(
-        objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), info);
-    ((void(*)(id,SEL,id))objc_msgSend)(label, sel_registerName("setStringValue:"), nsstr);
-
-    /* Add above all existing subviews (NSWindowAbove = 1) */
-    ((void(*)(id,SEL,id,int,id))objc_msgSend)(
-        cv, sel_registerName("addSubview:positioned:relativeTo:"),
-        label, 1, (id)0);
-
-    logmsg("[indicator] label added\n");
-
-    /* Remove after 8 seconds */
-    id retained = ((id(*)(id,SEL))objc_msgSend)(label, sel_registerName("retain"));
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
-        dispatch_get_main_queue(),
-        ^{
-            ((void(*)(id,SEL))objc_msgSend)(retained, sel_registerName("removeFromSuperview"));
-            ((void(*)(id,SEL))objc_msgSend)(retained, sel_registerName("release"));
-        }
-    );
-
-    free(info);
-}
-
-/* ------------------------------------------------------------------ */
 /* isRevokeMessage hook                                                */
 /* ------------------------------------------------------------------ */
 static uintptr_t wechat_base = 0;
@@ -241,44 +161,33 @@ int hook_isRevokeMessage_impl(void *msg, void *lr) {
 
     /* macOS-initiated self-revoke produces a malformed companion packet;
        phone-initiated self-revoke does not.  Use a time window to pair them. */
-    static uint64_t g_malformed_ts = 0;  /* mach_absolute_time of last malformed */
-    static uint64_t g_self_ts = 0;       /* mach_absolute_time of last self-text */
+    static uint64_t g_malformed_ts = 0;
+    static uint64_t g_self_ts = 0;
 
     uint64_t now = mach_absolute_time();
-    /* ~1 second window (mach_absolute_time ticks, arm64 ≈ 24MHz) */
     const uint64_t WINDOW = 24000000ULL * 2;
 
     if (is_malformed) {
         g_malformed_ts = now;
-        /* Check if a self-text was seen recently → macOS-initiated pair */
-        int from_macos = (g_self_ts && (now - g_self_ts) < WINDOW);
-        logmsg("[revoke] malformed packet, from_macos=%d → passthrough\n", from_macos);
-        return 1;  /* always passthrough malformed to avoid crash */
+        logmsg("[revoke] malformed packet → passthrough\n");
+        return 1;
     }
 
     if (is_self_text) {
         g_self_ts = now;
-        /* Check if a malformed packet was seen recently → macOS-initiated pair */
         int from_macos = (g_malformed_ts && (now - g_malformed_ts) < WINDOW);
         logmsg("[revoke] self-revoke, from_macos=%d\n", from_macos);
         if (from_macos) {
             return 1;  /* macOS-initiated: passthrough to avoid crash */
         }
-        /* Phone-initiated: fall through to block */
+        /* Phone-initiated self-revoke: fall through to block */
     }
 
+    /* ---- Others' revoke (or phone self-revoke): BLOCK ---- */
     if (newmsgid) revoked_add(newmsgid);
     if (msgid)    revoked_add(msgid);
 
-    /* Show indicator */
-    char *info = malloc(256);
-    if (info) {
-        snprintf(info, 256, "𝟚𝕏𝟚𝕃 𝚌𝚊𝚕𝚕𝚒𝚗𝚐 𝙲𝚀");
-        dispatch_async_f(dispatch_get_main_queue(), info,
-                         (dispatch_function_t)show_revoke_indicator);
-    }
-
-    return 0;  /* FALSE: block revoke */
+    return 0;  /* FALSE: block revoke, original message preserved */
 }
 
 /* ------------------------------------------------------------------ */
